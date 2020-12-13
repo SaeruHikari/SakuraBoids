@@ -13,6 +13,7 @@
 #include "ECS/ECS.h"
 
 #include "TransformComponents.h"
+#include "Boids.h"
 #include "TaskSystem/TaskSystem.h"
 #include "RuntimeCore/RuntimeCore.h"
 #include <iostream>
@@ -28,7 +29,7 @@ using Rotator = sakura::Rotator;
 using float4x4 = sakura::float4x4;
 using IModule = sakura::IModule;
 
-sakura::ecs::World ctx;
+sakura::ecs::world ctx;
 
 std::size_t calc_align(std::size_t n, std::size_t align)
 {
@@ -36,7 +37,7 @@ std::size_t calc_align(std::size_t n, std::size_t align)
 }
 
 template<class T>
-task_system::Event Local2XSystem(ecs::pipeline& ppl, ecs::filters& filter)
+task_system::Event Local2XSystem(task_system::ecs::pipeline& ppl, ecs::filters& filter)
 {
 	using namespace ecs;
 	def paramList = boost::hana::make_tuple(
@@ -45,9 +46,9 @@ task_system::Event Local2XSystem(ecs::pipeline& ppl, ecs::filters& filter)
 		// read.
 		param<const Translation>, param<const Rotation>, param<const Scale>
 	);
-	return task_system::ecs_schedule(ppl,
+	return task_system::ecs::schedule(ppl,
 		*ppl.create_pass(filter, paramList),
-		[](const ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			const sakura::Vector3f* scales = o.get_parameter<const Scale>();
@@ -66,18 +67,18 @@ task_system::Event Local2XSystem(ecs::pipeline& ppl, ecs::filters& filter)
 		});
 }
 
-task_system::Event RotationEulerSystem(ecs::pipeline& ppl)
+task_system::Event RotationEulerSystem(task_system::ecs::pipeline& ppl)
 {
 	using namespace ecs;
 	filters filter;
 	filter.archetypeFilter = {
-		{component_list<RotationEuler, Rotation>::typeset()}
+		{complist<RotationEuler, Rotation>}
 	};
 	def paramList =
 		boost::hana::make_tuple(param<const RotationEuler>, param<Rotation>);
-	return task_system::ecs_schedule(
+	return task_system::ecs::schedule(
 		ppl, *ppl.create_pass(filter, paramList),
-		[](const ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
             using namespace sakura::math;
             
@@ -92,14 +93,14 @@ task_system::Event RotationEulerSystem(ecs::pipeline& ppl)
 		});
 }
 
-task_system::Event Child2WorldSystem(ecs::pipeline& ppl)
+task_system::Event Child2WorldSystem(task_system::ecs::pipeline& ppl)
 {
 	using namespace ecs;
 	filters filter;
 	filter.archetypeFilter = {
-		{component_list<const Child, LocalToWorld>::typeset()},
+		{complist<Child, LocalToWorld>},
 		{},
-		{component_list<Parent, LocalToParent>::typeset()} // from root
+		{complist<Parent, LocalToParent>} // from root
 	};
 	def paramList = boost::hana::make_tuple(
 		// write
@@ -131,9 +132,9 @@ task_system::Event Child2WorldSystem(ecs::pipeline& ppl)
 			}
 		}
 	};
-	return task_system::ecs_schedule(ppl,
+	return task_system::ecs::schedule(ppl,
 		*ppl.create_pass(filter, paramList),
-		[](const ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			const auto childrens = o.get_parameter<const Child>();
@@ -150,12 +151,12 @@ task_system::Event Child2WorldSystem(ecs::pipeline& ppl)
 		});
 }
 
-task_system::Event World2LocalSystem(ecs::pipeline& ppl)
+task_system::Event World2LocalSystem(task_system::ecs::pipeline& ppl)
 {
 	using namespace ecs;
 	filters filter;
 	filter.archetypeFilter = {
-		{component_list<const LocalToWorld, WorldToLocal>::typeset()}, //all
+		{complist<LocalToWorld, WorldToLocal>}, //all
 		{}, //any
 		{} //none
 	};
@@ -165,9 +166,9 @@ task_system::Event World2LocalSystem(ecs::pipeline& ppl)
 		// read.
 		param<const LocalToWorld>
 	);
-	return task_system::ecs_schedule(ppl,
+	return task_system::ecs::schedule(ppl,
 		*ppl.create_pass(filter, paramList),
-		[](const ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			const float4x4* l2ws = o.get_parameter<const LocalToWorld>();
@@ -180,6 +181,53 @@ task_system::Event World2LocalSystem(ecs::pipeline& ppl)
 		});
 }
 
+template<class C, class T>
+task_system::Event CopyComponent(task_system::ecs::pipeline& ppl, const ecs::filters& filter, gsl::span<ecs::shared_entry> shareList, T& vector)
+{
+	using namespace ecs;
+	def paramList = hana::tuple{ param<const T> };
+	auto pass = ppl.create_pass(filter, paramList, shareList);
+	size_t matchedCount = 0;
+	forloop(i, 0, pass->archetypeCount)
+		matchedCount += pass->archetypes[i]->entitySize;
+	vector.resize(matchedCount);
+	return task_system::ecs::schedule(ppl, *pass,
+		[&vector](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		{
+			auto o = operation{ paramList, pass, tk };
+			auto index = o.get_index();
+			auto comps = o.get_parameter<const T>();
+			forloop(i, 0, o.get_count())
+				vector[index + i] = comps[i];
+		});
+}
+
+struct BoidPosition
+{
+	sakura::Vector3f value;
+	def dim = 3;
+	using value_type = float;
+	float operator[](size_t i) { return value.data_view()[i]; }
+};
+
+task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl)
+{
+	using namespace ecs;
+	filters filter;
+	filter.archetypeFilter =
+	{
+		{complist<Boid, LocalToWorld>}
+	};
+	hana::tuple paramList =
+	{
+		param<WorldToLocal>,
+		param<const Boid>
+	};
+	std::vector<BoidPosition> positions; //生命周期？
+	shared_ref positionRef = positions;
+	shared_entry shareList[] = { write(positionRef) };
+	return CopyComponent<Translation>(ppl, filter, shareList, positions);
+}
 
 int main()
 {
@@ -202,7 +250,7 @@ int main()
 	cid<Parent> = register_component<Parent>();
 	
 	entity_type type = {
-		component_list<Translation, RotationEuler, Rotation, Scale, LocalToWorld, WorldToLocal>::typeset() }; 
+		complist<Translation, RotationEuler, Rotation, Scale, LocalToWorld, WorldToLocal> }; 
 	{
 		for (auto c : ctx.allocate(type, 2000000))
 		{
@@ -265,7 +313,7 @@ int main()
 
 	while(1)
 	{
-		pipeline transform_pipeline(ctx);
+		task_system::ecs::pipeline transform_pipeline(ctx);
 		transform_pipeline.on_sync = [&](pass** dependencies, int dependencyCount)
 		{
 			forloop(i, 0, dependencyCount)
@@ -275,16 +323,16 @@ int main()
 
 		filters wrd_filter;
 		wrd_filter.archetypeFilter = {
-			{component_list<LocalToWorld>::typeset()},
-			{component_list<Translation, Scale, Rotation>::typeset()},
-			{component_list<LocalToParent, const Parent>::typeset()}
+			{complist<LocalToWorld>},
+			{complist<Translation, Scale, Rotation>},
+			{complist<LocalToParent, Parent>}
 		};
 		auto parentWorldSystem = Local2XSystem<LocalToWorld>(transform_pipeline, wrd_filter);
 
 		filters c2p_filter;
 		c2p_filter.archetypeFilter = {
-			{component_list<LocalToParent, const Parent>::typeset()},
-			{component_list<Translation, Scale, Rotation>::typeset()},
+			{complist<LocalToParent, Parent>},
+			{complist<Translation, Scale, Rotation>},
 			{}
 		};
 		auto child2ParentSystem = Local2XSystem<LocalToParent>(transform_pipeline, c2p_filter);
