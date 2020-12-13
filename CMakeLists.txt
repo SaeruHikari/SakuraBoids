@@ -16,7 +16,21 @@ INCLUDE(cmake/Initialize.cmake)
 set(SakuraEngine_DIR ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/../SakuraEngine/SakuraEngine/cmake)
 find_package(SakuraEngine REQUIRED 0.0.2)
 
-add_executable(Boids Source/Boids.cpp)
+file(GLOB_RECURSE 
+    MODULE_SRC_T
+    Source/*.cc
+    Source/*.cpp
+    Source/*.c
+    Source/*.cxx
+    Source/*.h
+    Source/*.hpp
+    Source/*.hxx
+    Source/*.inl
+
+    Source/*.natvis
+)
+
+add_executable(Boids ${MODULE_SRC_T})
 
 target_link_libraries(Boids SakuraEngine::Runtime::ECS)
 
