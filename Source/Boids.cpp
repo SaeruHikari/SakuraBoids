@@ -16,6 +16,7 @@
 #include "Boids.h"
 #include "TaskSystem/TaskSystem.h"
 #include "RuntimeCore/RuntimeCore.h"
+#include "kdtree.h"
 #include <iostream>
 
 #define forloop(i, z, n) for(auto i = std::decay_t<decltype(n)>(z); i<(n); ++i)
@@ -182,51 +183,151 @@ task_system::Event World2LocalSystem(task_system::ecs::pipeline& ppl)
 }
 
 template<class C, class T>
-task_system::Event CopyComponent(task_system::ecs::pipeline& ppl, const ecs::filters& filter, gsl::span<ecs::shared_entry> shareList, T& vector)
+task_system::Event CopyComponent(task_system::ecs::pipeline& ppl, const ecs::filters& filter, ecs::shared_resource<T>& vector)
 {
 	using namespace ecs;
 	def paramList = hana::tuple{ param<const T> };
+	shared_entry shareList[] = { write(vector) };
 	auto pass = ppl.create_pass(filter, paramList, shareList);
-	size_t matchedCount = 0;
-	forloop(i, 0, pass->archetypeCount)
-		matchedCount += pass->archetypes[i]->entitySize;
-	vector.resize(matchedCount);
+	vector->resize(pass->entityCount);
 	return task_system::ecs::schedule(ppl, *pass,
-		[&vector](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[vector](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			auto index = o.get_index();
 			auto comps = o.get_parameter<const T>();
 			forloop(i, 0, o.get_count())
-				vector[index + i] = comps[i];
+				(*vector)[index + i] = comps[i];
 		});
 }
 
 struct BoidPosition
 {
 	sakura::Vector3f value;
+	BoidPosition(sakura::Vector3f value)
+		:value(value) {}
 	def dim = 3;
 	using value_type = float;
 	float operator[](size_t i) { return value.data_view()[i]; }
 };
 
-task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl)
+sakura::Vector3f nearest_position(const sakura::Vector3f& query, const std::vector<sakura::Vector3f>& searchTargets)
+{
+	float minDistance = std::numeric_limits<float>::max();
+	sakura::Vector3f result;
+	for (const auto& target : searchTargets)
+	{
+		float d = distance(query, target);
+		if (d < minDistance)
+		{
+			minDistance = d;
+			result = target;
+		}
+	}
+	return result;
+}
+
+task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 {
 	using namespace ecs;
-	filters filter;
-	filter.archetypeFilter =
+	filters boidFilter;
+	boidFilter.archetypeFilter =
 	{
-		{complist<Boid, LocalToWorld>}
+		{complist<Boid, Translation, Heading>}
 	};
-	hana::tuple paramList =
+
+	//build kdtree, exact headings
+	auto positions = make_resource<std::vector<BoidPosition>>();
+	auto headings = make_resource<std::vector<Heading>>();
+	auto kdtree = make_resource<core::algo::kdtree<BoidPosition>>();
 	{
-		param<WorldToLocal>,
-		param<const Boid>
-	};
-	std::vector<BoidPosition> positions; //生命周期？
-	shared_ref positionRef = positions;
-	shared_entry shareList[] = { write(positionRef) };
-	return CopyComponent<Translation>(ppl, filter, shareList, positions);
+		auto copyPositionJob = CopyComponent<Translation>(ppl, boidFilter, positions);
+		CopyComponent<Heading>(ppl, boidFilter, headings);
+		task_system::Event buildTreeJob;
+		task_system::schedule([copyPositionJob, positions, kdtree, buildTreeJob]() mutable
+			{
+				defer(buildTreeJob.signal());
+				copyPositionJob.wait();  //todo：消除手动介入
+				kdtree->initialize(std::move(*positions));
+			});
+	}
+
+	//collect targets and obstacles
+	auto targets = make_resource<std::vector<sakura::Vector3f>>();
+	{
+		filters targetFilter;
+		targetFilter.archetypeFilter =
+		{
+			{complist<BoidTarget, Translation>}
+		};
+		CopyComponent<Translation>(ppl, targetFilter, targets);
+	}
+
+	//build new headings
+	auto newHeadings = make_resource<chunk_vector<sakura::Vector3f>>();
+	{
+		shared_entry shareList[] = { read(kdtree), read(headings), read(targets), write(newHeadings) };
+		def paramList = hana::tuple{ param<const Heading>, param<const Translation>, param<const Boid> };
+		auto pass = ppl.create_pass(boidFilter, paramList, shareList);
+		newHeadings->resize(pass->entityCount);
+		std::vector<task_system::Event> depList = { buildTreeJob };
+		task_system::ecs::schedule(ppl, *pass,
+			[headings, kdtree, targets, newHeadings](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+			{
+				auto o = operation{ paramList, pass, tk };
+				auto index = o.get_index();
+				auto hds = o.get_parameter_owned<const Heading>();
+				auto trs = o.get_parameter_owned<const Translation>();
+				auto boid = o.get_parameter<const Boid>();
+				std::vector<int> neighbers;
+				chunk_vector<sakura::Vector3f> alignments;
+				chunk_vector<sakura::Vector3f> separations;
+				chunk_vector<sakura::Vector3f> targetings;
+				alignments.resize(o.get_count());
+				separations.resize(o.get_count());
+				targetings.resize(o.get_count());
+				forloop(i, 0, o.get_count())
+				{
+					neighbers.clear();
+					kdtree->search_radius(trs[i], boid->SightRadius, neighbers);
+					alignments[i] = sakura::Vector3f::vector_zero();
+					separations[i] = sakura::Vector3f::vector_zero();
+					for (int ng : neighbers)
+					{
+						alignments[i] += (*headings)[ng].value;
+						separations[i] += (*kdtree)[ng].value;
+					}
+				}
+				forloop(i, 0, o.get_count())
+				{
+					targetings[i] = nearest_position(trs[i], *targets);
+				}
+				forloop(i, 0, o.get_count())
+				{
+					sakura::Vector3f alignment = math::normalize(alignments[i] / neighbers.size() - hds[i]);
+					sakura::Vector3f separation = math::normalize(neighbers.size() * trs[i] - separations[i]);
+					sakura::Vector3f targeting = math::normalize(targetings[i] - trs[i]);
+					(*newHeadings)[index + i] = math::normalize(alignment * boid->AlignmentWeight + separation * boid->SeparationWeight + targeting * boid->TargetWeight);
+				}
+			}, -1, std::move(depList));
+	}
+	{
+		shared_entry shareList[] = { read(newHeadings) };
+		def paramList = hana::tuple{ param<Heading>, param<Translation> };
+		return task_system::ecs::schedule(ppl, *ppl.create_pass(boidFilter, paramList, shareList),
+			[newHeadings, deltaTime](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+			{
+				auto o = operation{ paramList, pass, tk };
+				auto index = o.get_index();
+				auto hds = o.get_parameter<Heading>();
+				auto trs = o.get_parameter_owned<Translation>();
+				forloop(i, 0, o.get_count())
+				{
+					hds[i] = (*newHeadings)[i + index];
+					trs[i] += hds[i] * deltaTime;
+				}
+			});
+	}
 }
 
 int main()
