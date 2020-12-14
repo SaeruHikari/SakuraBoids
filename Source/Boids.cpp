@@ -233,7 +233,10 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 	filters boidFilter;
 	boidFilter.archetypeFilter =
 	{
-		{complist<Boid, Translation, Heading>}
+		{complist<Boid, Translation, Heading>}, //all
+		{}, //any
+		{}, //none
+		{complist<Boid>} //shared
 	};
 
 	//build kdtree, exact headings
@@ -243,11 +246,9 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 	{
 		auto copyPositionJob = CopyComponent<Translation>(ppl, boidFilter, positions);
 		CopyComponent<Heading>(ppl, boidFilter, headings);
-		task_system::Event buildTreeJob;
-		task_system::schedule([copyPositionJob, positions, kdtree, buildTreeJob]() mutable
+		shared_entry shareList[] = { read(positions), write(kdtree) };
+		task_system::ecs::schedule_custom(ppl, *ppl.create_custom_pass(shareList), [positions, kdtree]() mutable
 			{
-				defer(buildTreeJob.signal());
-				copyPositionJob.wait();  //todo：消除手动介入
 				kdtree->initialize(std::move(*positions));
 			});
 	}
@@ -270,7 +271,6 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 		def paramList = hana::tuple{ param<const Heading>, param<const Translation>, param<const Boid> };
 		auto pass = ppl.create_pass(boidFilter, paramList, shareList);
 		newHeadings->resize(pass->entityCount);
-		std::vector<task_system::Event> depList = { buildTreeJob };
 		task_system::ecs::schedule(ppl, *pass,
 			[headings, kdtree, targets, newHeadings](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 			{
@@ -278,7 +278,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				auto index = o.get_index();
 				auto hds = o.get_parameter_owned<const Heading>();
 				auto trs = o.get_parameter_owned<const Translation>();
-				auto boid = o.get_parameter<const Boid>();
+				auto boid = o.get_parameter<const Boid>(); //这玩意是 shared
 				std::vector<int> neighbers;
 				chunk_vector<sakura::Vector3f> alignments;
 				chunk_vector<sakura::Vector3f> separations;
@@ -309,11 +309,12 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 					sakura::Vector3f targeting = math::normalize(targetings[i] - trs[i]);
 					(*newHeadings)[index + i] = math::normalize(alignment * boid->AlignmentWeight + separation * boid->SeparationWeight + targeting * boid->TargetWeight);
 				}
-			}, -1, std::move(depList));
+			}, -1);
 	}
+	//
 	{
 		shared_entry shareList[] = { read(newHeadings) };
-		def paramList = hana::tuple{ param<Heading>, param<Translation> };
+		def paramList = hana::tuple{ param<Heading>, param<Translation>, param<const Boid> };
 		return task_system::ecs::schedule(ppl, *ppl.create_pass(boidFilter, paramList, shareList),
 			[newHeadings, deltaTime](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 			{
@@ -321,10 +322,11 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				auto index = o.get_index();
 				auto hds = o.get_parameter<Heading>();
 				auto trs = o.get_parameter_owned<Translation>();
+				auto boid = o.get_parameter<const Boid>(); //这玩意是 shared
 				forloop(i, 0, o.get_count())
 				{
 					hds[i] = (*newHeadings)[i + index];
-					trs[i] += hds[i] * deltaTime;
+					trs[i] += hds[i] * deltaTime * boid->MoveSpeed;
 				}
 			});
 	}
