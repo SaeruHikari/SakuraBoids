@@ -19,6 +19,7 @@ namespace core
 			{
 				std::vector<int> indices(points.size());
 				std::iota(indices.begin(), indices.end(), 0);
+				nodes.reserve(points.size());
 				build_recursive(indices, 0);
 			}
 
