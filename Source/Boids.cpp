@@ -18,6 +18,8 @@
 #include "RuntimeCore/RuntimeCore.h"
 #include "kdtree.h"
 #include <iostream>
+#include <random>
+#include <cmath>
 
 #define forloop(i, z, n) for(auto i = std::decay_t<decltype(n)>(z); i<(n); ++i)
 #define def static constexpr auto
@@ -37,34 +39,46 @@ std::size_t calc_align(std::size_t n, std::size_t align)
 	return ((n + align - 1) / align)* align;
 }
 
+template<class T, class... Ts, class F>
+task_system::Event ConvertSystem(task_system::ecs::pipeline& ppl, ecs::filters& filter, F&& f)
+{
+	using namespace ecs;
+	static_assert(std::is_invocable<F, value_type_t<T>, const value_type_t<Ts>...>(), "wrong signature of convert function");
+	static int timestamp = -1;
+	filter.chunkFilter =
+	{
+		complist<Ts...>,
+		timestamp
+	};
+	def paramList = hana::tuple{
+		param<T>,
+		param<const Ts>...
+	};
+	timestamp = ppl.get_timestamp();
+	return task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList),
+		[f](task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		{
+			auto o = operation{ paramList, pass, tk };
+			hana::tuple arrays = { o.get_parameter<T>(), o.get_parameter<const Ts>()... };
+			forloop(i, 0, o.get_count())
+			{
+				auto params = hana::transform(arrays, [i](auto v) { return v + i; });
+				hana::unpack(params, f);
+			}
+		});
+}
+
 template<class T>
 task_system::Event Local2XSystem(task_system::ecs::pipeline& ppl, ecs::filters& filter)
 {
-	using namespace ecs;
-	def paramList = boost::hana::make_tuple(
-		// write
-		param<T>,
-		// read.
-		param<const Translation>, param<const Rotation>, param<const Scale>
-	);
-	return task_system::ecs::schedule(ppl,
-		*ppl.create_pass(filter, paramList),
-		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+	return ConvertSystem<T, Translation, Rotation, Scale>(ppl, filter,
+		[](typename T::value_type* dst, const sakura::Vector3f* inTranslation, const sakura::Quaternion* inQuaternion, const sakura::Vector3f* inScale)
 		{
-			auto o = operation{ paramList, pass, tk };
-			const sakura::Vector3f* scales = o.get_parameter<const Scale>();
-			const sakura::Vector3f* translations = o.get_parameter<const Translation>();
-			const sakura::Quaternion* quaternions = o.get_parameter<const Rotation>();
-			float4x4* l2ws = o.get_parameter<T>();
+			const Vector3f scale = inScale ? *inScale : Vector3f::vector_one();
+			const Vector3f translation = inTranslation ? *inTranslation : Vector3f::vector_zero();
+			const Quaternion quaternion = inQuaternion ? *inQuaternion : Quaternion::identity();
 
-			forloop(i, 0, o.get_count())
-			{
-				const Vector3f scale = scales ? scales[i] : Vector3f::vector_one();
-				const Vector3f translation = translations ? translations[i] : Vector3f::vector_zero();
-				const Quaternion quaternion = quaternions ? quaternions[i] : Quaternion::identity();
-
-				l2ws[i] = math::make_transform(translation, scale, quaternion);
-			}
+			*dst = math::make_transform(translation, scale, quaternion);
 		});
 }
 
@@ -75,22 +89,25 @@ task_system::Event RotationEulerSystem(task_system::ecs::pipeline& ppl)
 	filter.archetypeFilter = {
 		{complist<RotationEuler, Rotation>}
 	};
-	def paramList =
-		boost::hana::make_tuple(param<const RotationEuler>, param<Rotation>);
-	return task_system::ecs::schedule(
-		ppl, *ppl.create_pass(filter, paramList),
-		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+	return ConvertSystem<Rotation, RotationEuler>(ppl, filter,
+		[](sakura::Quaternion* dst, const sakura::Rotator* inRotator)
 		{
-            using namespace sakura::math;
-            
-			auto o = operation{ paramList, pass, tk };
-			const sakura::Rotator* rotators = o.get_parameter<const RotationEuler>();
+			*dst = math::quaternion_from_rotator(*inRotator);
+		});
+}
 
-			auto rid = cid<Rotation>;
-			Quaternion* quaternions = o.get_parameter<Rotation>();
+task_system::Event HeadingSystem(task_system::ecs::pipeline& ppl)
+{
 
-			forloop(i, 0, o.get_count())
-				quaternions[i] = math::quaternion_from_rotator(rotators[i]);
+	using namespace ecs;
+	filters filter;
+	filter.archetypeFilter = {
+		{complist<Heading, Rotation>}
+	};
+	return ConvertSystem<Rotation, Heading>(ppl, filter,
+		[](sakura::Quaternion* dst, const sakura::Vector3f* inHeading)
+		{
+			*dst = math::look_at_quaternion(*inHeading);
 		});
 }
 
@@ -208,7 +225,7 @@ struct BoidPosition
 		:value(value) {}
 	def dim = 3;
 	using value_type = float;
-	float operator[](size_t i) { return value.data_view()[i]; }
+	float operator[](size_t i) const { return value.data_view()[i]; }
 };
 
 sakura::Vector3f nearest_position(const sakura::Vector3f& query, const std::vector<sakura::Vector3f>& searchTargets)
@@ -217,7 +234,7 @@ sakura::Vector3f nearest_position(const sakura::Vector3f& query, const std::vect
 	sakura::Vector3f result;
 	for (const auto& target : searchTargets)
 	{
-		float d = distance(query, target);
+		float d = math::distance(query, target);
 		if (d < minDistance)
 		{
 			minDistance = d;
@@ -225,6 +242,64 @@ sakura::Vector3f nearest_position(const sakura::Vector3f& query, const std::vect
 		}
 	}
 	return result;
+}
+
+task_system::Event RandomTargetSystem(task_system::ecs::pipeline& ppl)
+{
+	using namespace ecs;
+	filters filter;
+	filter.archetypeFilter =
+	{
+		{complist<Translation, MoveToward, RandomMoveTarget>}
+	};
+	def paramList = hana::tuple{
+		param<MoveToward>, param<const RandomMoveTarget>, param<const Translation>
+	};
+	static std::random_device r;
+	static std::default_random_engine el(r());
+	task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList), 
+		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		{
+			auto o = operation{ paramList, pass, tk };
+			auto mts = o.get_parameter<MoveToward>();
+			auto trs = o.get_parameter<const Translation>();
+			auto rmts = o.get_parameter<const RandomMoveTarget>();
+			forloop(i, 0, o.get_count())
+			{
+				if (math::subtract(mts[i].Target, trs[i]).is_nearly_zero())
+				{
+					auto sphere = rmts[i];
+					std::uniform_real_distribution<float> uniform_dist(0, 1);
+					sakura::Vector3f vector{ uniform_dist(el), uniform_dist(el), uniform_dist(el) };
+					float scale = std::cbrt(uniform_dist(el)) * sphere.Radius;
+					mts[i].Target = vector * scale;
+				}
+			}
+		});
+}
+
+task_system::Event MoveTowardSystem(task_system::ecs::pipeline& ppl, float deltaTime)
+{
+	using namespace ecs;
+	filters filter;
+	filter.archetypeFilter =
+	{
+		{complist<Translation, MoveToward>}
+	};
+	def paramList = hana::tuple{
+		param<Translation>, param<const MoveToward>
+	};
+	static std::random_device r;
+	static std::default_random_engine el(r());
+	task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList),
+		[deltaTime](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		{
+			auto o = operation{ paramList, pass, tk };
+			auto mts = o.get_parameter<const MoveToward>();
+			auto trs = o.get_parameter<Translation>();
+			forloop(i, 0, o.get_count())
+				trs[i] += math::normalize(mts[i].Target - trs[i]) * mts[i].MoveSpeed;
+		});
 }
 
 task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
@@ -236,10 +311,10 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 		{complist<Boid, Translation, Heading>}, //all
 		{}, //any
 		{}, //none
-		{complist<Boid>} //shared
+		complist<Boid> //shared
 	};
 
-	//build kdtree, exact headings
+	//构造 kdtree, 提取 headings
 	auto positions = make_resource<std::vector<BoidPosition>>();
 	auto headings = make_resource<std::vector<Heading>>();
 	auto kdtree = make_resource<core::algo::kdtree<BoidPosition>>();
@@ -253,7 +328,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 			});
 	}
 
-	//collect targets and obstacles
+	//收集目标和障碍物
 	auto targets = make_resource<std::vector<sakura::Vector3f>>();
 	{
 		filters targetFilter;
@@ -264,7 +339,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 		CopyComponent<Translation>(ppl, targetFilter, targets);
 	}
 
-	//build new headings
+	//计算新的朝向
 	auto newHeadings = make_resource<chunk_vector<sakura::Vector3f>>();
 	{
 		shared_entry shareList[] = { read(kdtree), read(headings), read(targets), write(newHeadings) };
@@ -272,7 +347,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 		auto pass = ppl.create_pass(boidFilter, paramList, shareList);
 		newHeadings->resize(pass->entityCount);
 		task_system::ecs::schedule(ppl, *pass,
-			[headings, kdtree, targets, newHeadings](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+			[headings, kdtree, targets, newHeadings, deltaTime](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk) mutable
 			{
 				auto o = operation{ paramList, pass, tk };
 				auto index = o.get_index();
@@ -288,6 +363,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				targetings.resize(o.get_count());
 				forloop(i, 0, o.get_count())
 				{
+					//收集附近单位的位置和朝向信息
 					neighbers.clear();
 					kdtree->search_radius(trs[i], boid->SightRadius, neighbers);
 					alignments[i] = sakura::Vector3f::vector_zero();
@@ -300,18 +376,22 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				}
 				forloop(i, 0, o.get_count())
 				{
+					//寻找一个目标
 					targetings[i] = nearest_position(trs[i], *targets);
 				}
 				forloop(i, 0, o.get_count())
 				{
+					//Boid 算法
+
 					sakura::Vector3f alignment = math::normalize(alignments[i] / neighbers.size() - hds[i]);
-					sakura::Vector3f separation = math::normalize(neighbers.size() * trs[i] - separations[i]);
+					sakura::Vector3f separation = math::normalize((float)neighbers.size() * trs[i] - separations[i]);
 					sakura::Vector3f targeting = math::normalize(targetings[i] - trs[i]);
-					(*newHeadings)[index + i] = math::normalize(alignment * boid->AlignmentWeight + separation * boid->SeparationWeight + targeting * boid->TargetWeight);
+					sakura::Vector3f newHeading = math::normalize(alignment * boid->AlignmentWeight + separation * boid->SeparationWeight + targeting * boid->TargetWeight);
+					(*newHeadings)[index + i] = math::normalize((hds[i] + (newHeading - hds[i]) * deltaTime));
 				}
 			}, -1);
 	}
-	//
+	//结果转换
 	{
 		shared_entry shareList[] = { read(newHeadings) };
 		def paramList = hana::tuple{ param<Heading>, param<Translation>, param<const Boid> };

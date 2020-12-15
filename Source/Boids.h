@@ -27,3 +27,15 @@ struct Heading
 	static constexpr auto guid = "BA82CDD4-56B8-40C5-BD5B-7AD8CFF867C4"_guid;
 	sakura::Vector3f value;
 };
+
+struct MoveToward
+{
+	sakura::Vector3f Target;
+	float MoveSpeed;
+};
+
+struct RandomMoveTarget
+{
+	sakura::Vector3f Center;
+	float Radius; 
+};
