@@ -3,8 +3,6 @@
 #include "ECS/ECS.h"
 #include "Math/Math.hpp"
 
-using VectorRegister = sakura::math::vector::VectorRegister;
-
 using namespace core::guid_parse::literals;
 namespace ecs = sakura::ecs;
 struct Translation
