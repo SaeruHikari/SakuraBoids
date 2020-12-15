@@ -76,6 +76,7 @@ namespace core
 				n.axis = axis;
 				n.children[0] = build_recursive({ indices.data(), mid }, depth + 1);
 				n.children[1] = build_recursive({ indices.data() + mid + 1, indices.size() - mid - 1 }, depth + 1);
+				return &n;
 			}
 
 			static Distance sdistance(const Point& lhs, const Point& rhs)

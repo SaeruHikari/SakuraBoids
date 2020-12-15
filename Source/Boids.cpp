@@ -44,7 +44,7 @@ task_system::Event ConvertSystem(task_system::ecs::pipeline& ppl, ecs::filters& 
 {
 	using namespace ecs;
 	static_assert(std::is_invocable<F, value_type_t<T>, const value_type_t<Ts>...>(), "wrong signature of convert function");
-	static int timestamp = -1;
+	static size_t timestamp = -1;
 	filter.chunkFilter =
 	{
 		complist<Ts...>,
@@ -56,7 +56,7 @@ task_system::Event ConvertSystem(task_system::ecs::pipeline& ppl, ecs::filters& 
 	};
 	timestamp = ppl.get_timestamp();
 	return task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList),
-		[f](task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[f](const task_system::ecs::pipeline& pipeline, const pass& pass, const task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			hana::tuple arrays = { o.get_parameter<T>(), o.get_parameter<const Ts>()... };
@@ -208,7 +208,7 @@ task_system::Event CopyComponent(task_system::ecs::pipeline& ppl, const ecs::fil
 	auto pass = ppl.create_pass(filter, paramList, shareList);
 	vector->resize(pass->entityCount);
 	return task_system::ecs::schedule(ppl, *pass,
-		[vector](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
+		[vector](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk) mutable
 		{
 			auto o = operation{ paramList, pass, tk };
 			auto index = o.get_index();
@@ -221,6 +221,7 @@ task_system::Event CopyComponent(task_system::ecs::pipeline& ppl, const ecs::fil
 struct BoidPosition
 {
 	sakura::Vector3f value;
+	BoidPosition() {}
 	BoidPosition(sakura::Vector3f value)
 		:value(value) {}
 	def dim = 3;
@@ -257,7 +258,7 @@ task_system::Event RandomTargetSystem(task_system::ecs::pipeline& ppl)
 	};
 	static std::random_device r;
 	static std::default_random_engine el(r());
-	task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList), 
+	return task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList), 
 		[](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
@@ -291,14 +292,14 @@ task_system::Event MoveTowardSystem(task_system::ecs::pipeline& ppl, float delta
 	};
 	static std::random_device r;
 	static std::default_random_engine el(r());
-	task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList),
+	return task_system::ecs::schedule(ppl, *ppl.create_pass(filter, paramList),
 		[deltaTime](const task_system::ecs::pipeline& pipeline, const ecs::pass& pass, const ecs::task& tk)
 		{
 			auto o = operation{ paramList, pass, tk };
 			auto mts = o.get_parameter<const MoveToward>();
 			auto trs = o.get_parameter<Translation>();
 			forloop(i, 0, o.get_count())
-				trs[i] += math::normalize(mts[i].Target - trs[i]) * mts[i].MoveSpeed;
+				trs[i] = trs[i] + math::normalize(mts[i].Target - trs[i]) * mts[i].MoveSpeed;
 		});
 }
 
@@ -370,8 +371,8 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 					separations[i] = sakura::Vector3f::vector_zero();
 					for (int ng : neighbers)
 					{
-						alignments[i] += (*headings)[ng].value;
-						separations[i] += (*kdtree)[ng].value;
+						alignments[i] = alignments[i] + (*headings)[ng].value;
+						separations[i] = separations[i] +(*kdtree)[ng].value;
 					}
 				}
 				forloop(i, 0, o.get_count())
@@ -383,7 +384,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				{
 					//Boid 算法
 
-					sakura::Vector3f alignment = math::normalize(alignments[i] / neighbers.size() - hds[i]);
+					sakura::Vector3f alignment = math::normalize(alignments[i] / (float)neighbers.size() - hds[i]);
 					sakura::Vector3f separation = math::normalize((float)neighbers.size() * trs[i] - separations[i]);
 					sakura::Vector3f targeting = math::normalize(targetings[i] - trs[i]);
 					sakura::Vector3f newHeading = math::normalize(alignment * boid->AlignmentWeight + separation * boid->SeparationWeight + targeting * boid->TargetWeight);
@@ -406,7 +407,7 @@ task_system::Event BoidsSystem(task_system::ecs::pipeline& ppl, float deltaTime)
 				forloop(i, 0, o.get_count())
 				{
 					hds[i] = (*newHeadings)[i + index];
-					trs[i] += hds[i] * deltaTime * boid->MoveSpeed;
+					trs[i] = trs[i] + hds[i] * deltaTime * boid->MoveSpeed;
 				}
 			});
 	}
